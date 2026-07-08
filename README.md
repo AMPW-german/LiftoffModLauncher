@@ -15,5 +15,7 @@ Please report any issues you encounter on the [Issues](https://github.com/AMPW-g
    "D:\SteamLibrary\steamapps\common\Liftoff\LiftoffModLauncher-win-x64.exe" %command%\
    It will fail if you don't use the FULL PATH to the executable.
 
+![Launcher preview](LauncherExample.png)
+
 ## Building from source
 Open a terminal in the root folder of the repository and run run the build.bat script. It builds the project for all platforms.
