@@ -87,18 +87,27 @@ namespace LiftoffModLauncher
 
         static int Main(string[] args)
         {
-            // The game executable path is passed by Steam via %command%.
+            // The game executable path is passed by Steam via %command%. When run
+            // without it (e.g. the user double-clicked the launcher), act as a setup
+            // helper: print the exact launch-options line with this launcher's own
+            // absolute path filled in, so it can be copied straight into Steam.
             if (args.Length == 0 || string.IsNullOrWhiteSpace(args[0]))
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("Error: no game path provided.");
+                string launcherPath = Environment.ProcessPath ?? "LiftoffModLauncher-win-x64.exe";
+
+                Console.WriteLine("Liftoff Mod Launcher - Setup");
+                Console.WriteLine();
+                Console.WriteLine("This launcher is meant to be started by Steam, not on its own.");
+                Console.WriteLine("Copy the line below into Steam > Liftoff > Properties > Launch Options:");
+                Console.WriteLine();
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\"{launcherPath}\" %command%");
                 Console.ResetColor();
-                Console.WriteLine("This launcher expects the full path to the Liftoff executable as its first argument.");
-                Console.WriteLine("Set it in Steam > Liftoff > Properties > Launch Options, e.g.:");
-                Console.WriteLine("  \"C:\\...\\LiftoffModLauncher-win-x64.exe\" %command%");
+                Console.WriteLine();
+                Console.WriteLine("Then launch Liftoff from Steam as usual and this menu will appear.");
                 Console.WriteLine("Press Enter to exit.");
                 Console.ReadLine();
-                return 1;
+                return 0;
             }
 
             string gamePath = args[0];
