@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "LiftoffModLauncher": {
+      "commandName": "Project",
+      "commandLineArgs": "\"D:\\SteamLibrary\\steamapps\\common\\Liftoff\\Liftoff.exe\"",
+      "workingDirectory": "D:\\SteamLibrary\\steamapps\\common\\Liftoff"
+    }
+  }
+}
