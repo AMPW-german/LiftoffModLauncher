@@ -10,10 +10,12 @@ Please report any issues you encounter on the [Issues](https://github.com/AMPW-g
 
 1. Download the latest release for your OS from the [Releases](https://github.com/AMPW-german/LiftoffModLauncher/releases) page.
 2. Extract the downloaded archive to a folder of your choice (can be in the same folder as the game).
-3. Open Steam and go to your Library. Right-click on Liftoff: Drone Racing and select "Properties".
-4. In the "General" tab, click on the "Launch Options" input field and write the FULL path to the LiftoffModLauncher executable in qoutes followed by %command%. E.g.:\
-   "D:\SteamLibrary\steamapps\common\Liftoff\LiftoffModLauncher-win-x64.exe" %command%\
-   It will fail if you don't use the FULL PATH to the executable.
+3. **Double-click the launcher executable once.** Because it wasn't started by Steam, it shows a setup screen and prints the exact launch-options line for *your* install, already containing the full path and quotes, e.g.:\
+   `"D:\SteamLibrary\steamapps\common\Liftoff\LiftoffModLauncher-win-x64.exe" %command%`
+4. Open Steam and go to your Library. Right-click on Liftoff: Drone Racing and select "Properties".
+5. In the "General" tab, paste that line into the "Launch Options" input field.
+
+> **Note:** A full path is required — a relative path such as `.\LiftoffModLauncher-win-x64.exe` will not work, because Steam does not set the launcher's working directory to the game folder. Using the line the launcher prints in step 3 avoids having to type the path by hand.
 
 ![Launcher preview](LauncherExample.png)
 
