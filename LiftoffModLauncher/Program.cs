@@ -258,7 +258,6 @@ namespace LiftoffModLauncher
 
                     movingObjectsUpdateAvailable = latestVersion > currentVersion;
                 }
-                else throw new Exception("Could not retrieve the latest release tag from GitHub.");
             }
 
             SortedDictionary<MenuOption, string> menuOptions = new SortedDictionary<MenuOption, string>
