@@ -42,7 +42,5 @@ Please report any issues you encounter on the [Issues](https://github.com/AMPW-g
 
 > **Note:** A full path is required — a relative path such as `.\LiftoffModLauncher-win-x64.exe` will not work, because Steam does not set the launcher's working directory to the game folder. Using the line the launcher prints in step 3 avoids having to type the path by hand.
 
-![Launcher preview](LauncherExample.png)
-
 ## Building from source
 Open a terminal in the root folder of the repository and run run the build.bat script. It builds the project for all platforms.
