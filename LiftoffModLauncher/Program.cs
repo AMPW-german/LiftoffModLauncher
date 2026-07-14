@@ -10,9 +10,24 @@ namespace LiftoffModLauncher
     {
         private static string liftoffDirectory = string.Empty;
 
+        private const string Platform =
+#if WINDOWS
+            "win_x64";
+#elif LINUX
+            "linux_x64";
+#elif OSX
+            "macos_x64";
+#else
+            "win_x64";
+#endif
+
         // Files/directories that make up the mod loader. BepInEx is a directory,
         // the other two are files, but Enable/Disable treat them uniformly.
         private static readonly string[] ModItems = { "BepInEx", "doorstop_config.ini", "winhttp.dll" };
+
+        // BepInEx:
+        private const string BepInExDirectoryName = "BepInEx";
+        private const string BepInExReleasesApiUrl = "https://api.github.com/repos/BepInEx/BepInEx/releases/latest";
 
         // The Moving Objects mod: the plugin DLL (whose version we read) plus the
         // GitHub repo we check for the latest release.
@@ -24,11 +39,28 @@ namespace LiftoffModLauncher
 
         // Serialises all console writes: the background update check rewrites the
         // hint line while the input loop redraws the menu on another thread.
-        private static readonly object ConsoleLock = new object();
+        private static readonly SemaphoreSlim ConsoleLock = new SemaphoreSlim(1, 1);
+        private static readonly ConsoleColor DefaultForegroundColor = ConsoleColor.Gray;
 
-        // Set by the background check, read by the input loop when the user presses U.
-        private static volatile bool _updateAvailable;
-        private static volatile string? _updateZipUrl;
+        private static void WithConsoleLock(Action action)
+        {
+            ConsoleLock.Wait();
+            try
+            {
+                action();
+            }
+            finally
+            {
+                ConsoleLock.Release();
+            }
+        }
+
+        // Set by the background check
+        private static volatile bool _BepInExInstalled = false;
+        private static volatile string? _updateBepInExZipUrl;
+        private static volatile string? _updateBepInExZipName;
+        private static volatile string? _updateMovingObjectsZipUrl;
+        private static volatile string? _updateMovingObjectsZipName;
 
         private enum MenuOption
         {
@@ -37,6 +69,60 @@ namespace LiftoffModLauncher
             UpdateMovingObjectsMod,
             UpdateBepInEx,
             Exit,
+        }
+
+        static SortedDictionary<MenuOption, string> menuOptions = new SortedDictionary<MenuOption, string>
+        {
+            { MenuOption.LaunchLiftoff, "Launch Liftoff" },
+            { MenuOption.LaunchLiftoffWithMods, "Launch Liftoff with Mods" },
+            { MenuOption.UpdateMovingObjectsMod, "Moving Objects Update" },
+            { MenuOption.UpdateBepInEx, "BepInEx Update" },
+            { MenuOption.Exit, "Exit" },
+        };
+
+
+        static List<MenuOption> disabledOptions = new List<MenuOption>
+        {
+            MenuOption.UpdateMovingObjectsMod,
+            MenuOption.UpdateBepInEx,
+        };
+
+        static int currentSelection = 0;
+        static ConsoleColor selectedColor = ConsoleColor.Red;
+        static ConsoleColor disabledColor = ConsoleColor.DarkGray;
+
+        private sealed class CVersion : IComparable<CVersion>
+        {
+            public int Major { get; }
+            public int Minor { get; }
+            public int Build { get; }
+            public int Revision { get; }
+
+            public CVersion(int major, int minor = 0, int build = 0, int revision = 0)
+            {
+                Major = major;
+                Minor = minor;
+                Build = build;
+                Revision = revision;
+            }
+
+            public int CompareTo(CVersion? other)
+            {
+                if (other is null) return 1;
+
+                int result = Major.CompareTo(other.Major);
+                if (result != 0) return result;
+
+                result = Minor.CompareTo(other.Minor);
+                if (result != 0) return result;
+
+                result = Build.CompareTo(other.Build);
+                if (result != 0) return result;
+
+                return Revision.CompareTo(other.Revision);
+            }
+
+            public override string ToString() => $"{Major}.{Minor}.{Build}.{Revision}";
         }
 
         private static bool PathExists(string path) => Directory.Exists(path) || File.Exists(path);
@@ -56,6 +142,8 @@ namespace LiftoffModLauncher
         // True when the mod loader is currently active (any active item present).
         private static bool ModsEnabled(string liftoffDirectory)
         {
+            if (!_BepInExInstalled) return false;
+
             foreach (string name in ModItems)
             {
                 if (PathExists(Path.Combine(liftoffDirectory, name))) return true;
@@ -65,6 +153,8 @@ namespace LiftoffModLauncher
 
         private static void EnableMods(string liftoffDirectory)
         {
+            if (!_BepInExInstalled) return;
+
             // For each item: if the active name is already present it's enabled;
             // otherwise restore it from its "_" prefixed backup. Missing both is an error.
             foreach (string name in ModItems)
@@ -80,11 +170,14 @@ namespace LiftoffModLauncher
                 }
                 else
                 {
-                    Console.Clear();
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"Error: neither '{name}' nor '_{name}' found in Liftoff directory.");
-                    Console.ResetColor();
-                    Console.Read();
+                    WithConsoleLock(() =>
+                    {
+                        Console.Clear();
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"Error: neither '{name}' nor '_{name}' found in Liftoff directory.");
+                        Console.ForegroundColor = DefaultForegroundColor;
+                        Console.Read();
+                    });
                     throw new FileNotFoundException($"'{name}' not found in Liftoff directory.");
                 }
             }
@@ -92,6 +185,8 @@ namespace LiftoffModLauncher
 
         private static void DisableMods(string liftoffDirectory)
         {
+            if (!_BepInExInstalled) return;
+
             // For each item: if it isn't active there's nothing to disable; otherwise
             // clear any stale backup and move the active item aside to "_" prefixed.
             // Guarded so a first run (no backups yet) or an already-disabled state
@@ -132,7 +227,7 @@ namespace LiftoffModLauncher
 
         // Read the version embedded in the plugin DLL by inspecting its file metadata
         // (never loads/runs the assembly).
-        private static Version? ReadLocalVersion(string dllPath)
+        private static CVersion? ReadLocalVersion(string dllPath)
         {
             try
             {
@@ -147,7 +242,7 @@ namespace LiftoffModLauncher
 
         // Normalise a version string ("v1.3.6", "1.3.6.0", "1.3.6+githash") to a
         // Major.Minor.Build Version for comparison.
-        private static Version? ParseVersion(string? raw)
+        private static CVersion? ParseVersion(string? raw)
         {
             if (string.IsNullOrWhiteSpace(raw)) return null;
 
@@ -158,63 +253,113 @@ namespace LiftoffModLauncher
             int major = parts.Length > 0 ? int.Parse(parts[0]) : 0;
             int minor = parts.Length > 1 ? int.Parse(parts[1]) : 0;
             int build = parts.Length > 2 ? int.Parse(parts[2]) : 0;
-            return new Version(major, minor, build);
+            int revision = parts.Length > 3 ? int.Parse(parts[3]) : 0;
+            return new CVersion(major, minor, build, revision);
         }
 
 
-        private static string FormatVersion(Version? v) => v is null ? "?" : $"{v.Major}.{v.Minor}.{v.Build}";
+        private static string FormatVersion(CVersion? v) => v is null ? "?" : v.ToString();
+
+        private static (string? ZipUrl, string? ZipName) GetZipAsset(JsonElement release)
+        {
+            string? zipUrl = null;
+            string? zipName = null;
+
+            if (release.TryGetProperty("assets", out JsonElement assets) &&
+                assets.ValueKind == JsonValueKind.Array)
+            {
+                // If there's only one asset, check if it's a zip file and get its download URL
+                if (assets.GetArrayLength() == 1)
+                {
+                    string? name = assets[0].TryGetProperty("name", out JsonElement n) ? n.GetString() : null;
+                    if (name != null && name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+                    {
+                        zipUrl = assets[0].TryGetProperty("browser_download_url", out JsonElement u)
+                            ? u.GetString()
+                            : null;
+                        zipName = name;
+                    }
+                }
+                else
+                {
+                    foreach (JsonElement asset in assets.EnumerateArray())
+                    {
+                        string? name = asset.TryGetProperty("name", out JsonElement n) ? n.GetString() : null;
+                        if (name != null && name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) && name.Contains(Platform, StringComparison.OrdinalIgnoreCase))
+                        {
+                            zipUrl = asset.TryGetProperty("browser_download_url", out JsonElement u)
+                                ? u.GetString()
+                                : null;
+                            zipName = name;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return (zipUrl, zipName);
+        }
 
         // Fetch the latest GitHub release. Returns the tag plus the download URL of the
         // .zip asset (null if the release has no zip). Returns null on any failure so
         // the caller never has to handle exceptions or blocks.
-        private static async Task<(string Tag, string? ZipUrl)?> FetchLatestReleaseAsync(string ReleaseUrl, string platform = "win_x64")
+        private static async Task<(string Tag, string? ZipUrl, string? ZipName)?> FetchLatestReleaseAsync(string ReleaseUrl, CVersion? maxVersion = null)
         {
             try
             {
-                using HttpResponseMessage response = await Http.GetAsync(ReleaseUrl);
+                string requestUrl = maxVersion is null
+                    ? ReleaseUrl
+                    : (ReleaseUrl.EndsWith("/latest", StringComparison.OrdinalIgnoreCase)
+                        ? ReleaseUrl[..^"/latest".Length]
+                        : ReleaseUrl);
+
+                using HttpResponseMessage response = await Http.GetAsync(requestUrl);
                 response.EnsureSuccessStatusCode();
 
                 await using Stream stream = await response.Content.ReadAsStreamAsync();
                 using JsonDocument doc = await JsonDocument.ParseAsync(stream);
                 JsonElement root = doc.RootElement;
 
-                string? tag = root.TryGetProperty("tag_name", out JsonElement tagEl)
-                    ? tagEl.GetString()
-                    : null;
-                if (string.IsNullOrEmpty(tag)) return null;
-
-                string? zipUrl = null;
-                if (root.TryGetProperty("assets", out JsonElement assets) &&
-                    assets.ValueKind == JsonValueKind.Array)
+                if (maxVersion is null)
                 {
-                    // If there's only one asset, check if it's a zip file and get its download URL
-                    if (assets.GetArrayLength() == 1)
-                    {
-                        string? name = assets[0].TryGetProperty("name", out JsonElement n) ? n.GetString() : null;
-                        if (name != null && name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
-                        {
-                            zipUrl = assets[0].TryGetProperty("browser_download_url", out JsonElement u)
-                                ? u.GetString()
-                                : null;
-                        }
-                    }
-                    else
-                    {
-                        foreach (JsonElement asset in assets.EnumerateArray())
-                        {
-                            string? name = asset.TryGetProperty("name", out JsonElement n) ? n.GetString() : null;
-                            if (name != null && name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) && name.Contains(platform, StringComparison.OrdinalIgnoreCase))
-                            {
-                                zipUrl = asset.TryGetProperty("browser_download_url", out JsonElement u)
-                                    ? u.GetString()
-                                    : null;
-                                break;
-                            }
-                        }
-                    }
+                    string? tag = root.TryGetProperty("tag_name", out JsonElement tagEl)
+                        ? tagEl.GetString()
+                        : null;
+                    if (string.IsNullOrEmpty(tag)) return null;
+
+                    (string? zipUrl, string? zipName) = GetZipAsset(root);
+                    return (tag, zipUrl, zipName);
                 }
 
-                return (tag, zipUrl);
+                if (root.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (JsonElement release in root.EnumerateArray())
+                    {
+                        bool isDraft = release.TryGetProperty("draft", out JsonElement draftEl) && draftEl.ValueKind == JsonValueKind.True;
+                        bool isPrerelease = release.TryGetProperty("prerelease", out JsonElement preEl) && preEl.ValueKind == JsonValueKind.True;
+                        if (isDraft || isPrerelease) continue;
+
+                        string? tag = release.TryGetProperty("tag_name", out JsonElement tagEl)
+                            ? tagEl.GetString()
+                            : null;
+                        CVersion? releaseVersion = ParseVersion(tag);
+
+                        if (releaseVersion is null || releaseVersion.CompareTo(maxVersion) > 0) continue;
+
+                        (string? zipUrl, string? zipName) = GetZipAsset(release);
+                        return (tag!, zipUrl, zipName);
+                    }
+                    return null;
+                }
+
+                string? singleTag = root.TryGetProperty("tag_name", out JsonElement singleTagEl)
+                    ? singleTagEl.GetString()
+                    : null;
+                CVersion? singleVersion = ParseVersion(singleTag);
+                if (singleVersion is null || singleVersion.CompareTo(maxVersion) > 0) return null;
+
+                (string? singleZipUrl, string? singleZipName) = GetZipAsset(root);
+                return (singleTag!, singleZipUrl, singleZipName);
             }
             catch
             {
@@ -222,54 +367,235 @@ namespace LiftoffModLauncher
             }
         }
 
-        public static async Task UpdateMovingObjectsMod(string gameDirectory, string repoPath, CancellationToken cancellationToken = default)
+        public static async Task UpdateBepInEx(CancellationToken cancellationToken = default)
         {
-            string modUpdateDirectory = Path.Combine(gameDirectory, "modUpdate");
-            string bepInExDirectory = Path.Combine(gameDirectory, "BepInEx");
-            string bepInExSaveDirectory = Path.Combine(gameDirectory, "_BepInEx");
+            // Download the latest BepInEx 5.x.x.x release and extract it to the Liftoff directory, replacing existing files
+            string modUpdateDirectory = Path.Combine(liftoffDirectory, "modUpdate");
 
-            if (!Directory.Exists(bepInExDirectory) && Directory.Exists(bepInExSaveDirectory)) bepInExDirectory = bepInExSaveDirectory;
-
-            Console.Clear();
-            Console.SetCursorPosition(0, 0);
-            Console.WriteLine("Updating Moving Objects Mod...");
+            await ConsoleLock.WaitAsync(cancellationToken);
 
             var backups = new List<(string Target, string Backup)>();
             var copiedTargets = new List<string>();
 
             try
             {
+                Console.Clear();
+                Console.SetCursorPosition(0, 0);
+                Console.WriteLine("Updating BepInEx...");
+
+                if (Directory.Exists(modUpdateDirectory)) Directory.Delete(modUpdateDirectory, true);
+                Directory.CreateDirectory(modUpdateDirectory);
+
+                string? downloadUrl = _updateBepInExZipUrl;
+                string? assetNameValue = _updateBepInExZipName;
+
+                if (string.IsNullOrWhiteSpace(downloadUrl) || string.IsNullOrWhiteSpace(assetNameValue))
+                {
+                    throw new InvalidOperationException("No prepared download URL or asset name found for the BepInEx update.");
+                }
+
+                string zipFilePath = Path.Combine(modUpdateDirectory, assetNameValue);
+                using var downloadResponse = await Http.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+                downloadResponse.EnsureSuccessStatusCode();
+
+                Console.WriteLine("Downloading latest release...");
+                long? totalBytes = downloadResponse.Content.Headers.ContentLength;
+                await using (var targetFile = File.Create(zipFilePath))
+                {
+                    await using Stream sourceStream = await downloadResponse.Content.ReadAsStreamAsync(cancellationToken);
+                    byte[] buffer = new byte[81920];
+                    long bytesReadTotal = 0;
+                    DateTime lastProgressOutputUtc = DateTime.MinValue;
+
+                    while (true)
+                    {
+                        int bytesRead = await sourceStream.ReadAsync(buffer, cancellationToken);
+                        if (bytesRead == 0) break;
+
+                        await targetFile.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+                        bytesReadTotal += bytesRead;
+
+                        bool shouldUpdate = DateTime.UtcNow - lastProgressOutputUtc >= TimeSpan.FromMilliseconds(250);
+                        if (!shouldUpdate && totalBytes.HasValue && bytesReadTotal == totalBytes.Value)
+                        {
+                            shouldUpdate = true;
+                        }
+
+                        if (!shouldUpdate) continue;
+
+                        if (totalBytes.HasValue && totalBytes.Value > 0)
+                        {
+                            double percent = (double)bytesReadTotal * 100d / totalBytes.Value;
+                            Console.Write($"\rDownloading latest release... {percent:0.0}% ({bytesReadTotal / 1024d / 1024d:0.00} MB / {totalBytes.Value / 1024d / 1024d:0.00} MB)   ");
+                        }
+                        else
+                        {
+                            Console.Write($"\rDownloading latest release... {bytesReadTotal / 1024d / 1024d:0.00} MB   ");
+                        }
+
+                        lastProgressOutputUtc = DateTime.UtcNow;
+                    }
+                }
+                Console.WriteLine();
+                Console.WriteLine("Finished downloading latest release. Replacing old files...");
+
+                string extractDirectory = Path.Combine(modUpdateDirectory, "extracted");
+                Directory.CreateDirectory(extractDirectory);
+                ZipFile.ExtractToDirectory(zipFilePath, extractDirectory, true);
+
+                string extractedBepInExDirectory = Path.Combine(extractDirectory, "BepInEx");
+                if (!Directory.Exists(extractedBepInExDirectory))
+                {
+                    throw new InvalidDataException("Downloaded archive did not contain a BepInEx folder.");
+                }
+
+                string targetBepInExDirectory = Path.Combine(liftoffDirectory, "BepInEx");
+                if (Directory.Exists(targetBepInExDirectory))
+                {
+                    foreach (string directory in Directory.GetDirectories(targetBepInExDirectory))
+                    {
+                        string name = Path.GetFileName(directory);
+                        if (name.Equals("plugins", StringComparison.OrdinalIgnoreCase) ||
+                            name.Equals("patchers", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        string backupPath = directory + ".bak";
+                        if (Directory.Exists(backupPath)) Directory.Delete(backupPath, true);
+                        Directory.Move(directory, backupPath);
+                        backups.Add((directory, backupPath));
+                    }
+                }
+
+                foreach (string fileName in new[] { "doorstop_config.ini", "winhttp.dll" })
+                {
+                    string targetPath = Path.Combine(liftoffDirectory, fileName);
+                    if (!File.Exists(targetPath)) continue;
+
+                    string backupPath = targetPath + ".bak";
+                    if (File.Exists(backupPath)) File.Delete(backupPath);
+                    File.Move(targetPath, backupPath);
+                    backups.Add((targetPath, backupPath));
+                }
+
+                string[] sourceFiles = Directory.GetFiles(extractDirectory, "*", SearchOption.AllDirectories);
+                if (sourceFiles.Length == 0)
+                {
+                    throw new InvalidDataException("Downloaded archive did not contain any files.");
+                }
+
+                for (int i = 0; i < sourceFiles.Length; i++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    string sourceFile = sourceFiles[i];
+                    string relativePath = Path.GetRelativePath(extractDirectory, sourceFile);
+                    string targetFilePath = Path.Combine(liftoffDirectory, relativePath);
+                    string? targetDirectory = Path.GetDirectoryName(targetFilePath);
+                    if (!string.IsNullOrEmpty(targetDirectory)) Directory.CreateDirectory(targetDirectory);
+
+                    if (File.Exists(targetFilePath))
+                    {
+                        string backupPath = targetFilePath + ".bak";
+                        if (File.Exists(backupPath)) File.Delete(backupPath);
+                        File.Move(targetFilePath, backupPath);
+                        backups.Add((targetFilePath, backupPath));
+                    }
+
+                    File.Copy(sourceFile, targetFilePath, true);
+                    copiedTargets.Add(targetFilePath);
+
+                    Console.WriteLine($"[{i + 1}/{sourceFiles.Length}] Updated {relativePath}");
+                }
+
+                foreach ((string _, string backup) in backups)
+                {
+                    if (PathExists(backup)) DeletePath(backup);
+                }
+
+                _BepInExInstalled = true;
+                Console.WriteLine("Finished updating BepInEx.");
+                Thread.Sleep(2000); // Wait for 2 seconds before clearing the console
+                CheckBepInExUpdate();
+            }
+            catch (Exception ex)
+            {
+                for (int i = copiedTargets.Count - 1; i >= 0; i--)
+                {
+                    string target = copiedTargets[i];
+                    try
+                    {
+                        if (File.Exists(target)) File.Delete(target);
+                    }
+                    catch
+                    {
+                        // Best effort rollback.
+                    }
+                }
+
+                for (int i = backups.Count - 1; i >= 0; i--)
+                {
+                    (string target, string backup) = backups[i];
+                    try
+                    {
+                        if (PathExists(target)) DeletePath(target);
+                        if (PathExists(backup)) MovePath(backup, target);
+                    }
+                    catch
+                    {
+                        // Best effort rollback.
+                    }
+                }
+
+                Console.Clear();
+                Console.SetCursorPosition(0, 0);
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Error updating BepInEx: {ex.Message}");
+                Console.ForegroundColor = DefaultForegroundColor;
+                Console.ReadLine();
+                throw;
+            }
+            finally
+            {
+                ConsoleLock.Release();
+                if (Directory.Exists(modUpdateDirectory)) Directory.Delete(modUpdateDirectory, true);
+            }
+
+        }
+
+        public static async Task UpdateMovingObjectsMod(CancellationToken cancellationToken = default)
+        {
+            if (!_BepInExInstalled) UpdateBepInEx().GetAwaiter().GetResult();
+
+            string modUpdateDirectory = Path.Combine(liftoffDirectory, "modUpdate");
+            string bepInExDirectory = Path.Combine(liftoffDirectory, "BepInEx");
+            string bepInExSaveDirectory = Path.Combine(liftoffDirectory, "_BepInEx");
+
+            if (!Directory.Exists(bepInExDirectory) && Directory.Exists(bepInExSaveDirectory)) bepInExDirectory = bepInExSaveDirectory;
+
+            await ConsoleLock.WaitAsync(cancellationToken);
+
+            var backups = new List<(string Target, string Backup)>();
+            var copiedTargets = new List<string>();
+
+            try
+            {
+                Console.Clear();
+                Console.SetCursorPosition(0, 0);
+                Console.WriteLine("Updating Moving Objects Mod...");
+
                 if (Directory.Exists(modUpdateDirectory)) Directory.Delete(modUpdateDirectory, true);
 
                 Directory.CreateDirectory(modUpdateDirectory);
 
-                var latestReleaseUrl = $"https://api.github.com/repos/{repoPath}/releases/latest";
-                using var latestResponse = await Http.GetAsync(latestReleaseUrl, cancellationToken);
-                latestResponse.EnsureSuccessStatusCode();
+                string? downloadUrl = _updateMovingObjectsZipUrl;
+                string? assetNameValue = _updateMovingObjectsZipName;
 
-                await using var latestJsonStream = await latestResponse.Content.ReadAsStreamAsync(cancellationToken);
-                using var latestJson = await JsonDocument.ParseAsync(latestJsonStream, cancellationToken: cancellationToken);
-
-                JsonElement? selectedAsset = null;
-                foreach (var asset in latestJson.RootElement.GetProperty("assets").EnumerateArray())
+                if (string.IsNullOrWhiteSpace(downloadUrl) || string.IsNullOrWhiteSpace(assetNameValue))
                 {
-                    var assetName = asset.GetProperty("name").GetString() ?? string.Empty;
-                    if (assetName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) &&
-                        !assetName.Contains("source", StringComparison.OrdinalIgnoreCase))
-                    {
-                        selectedAsset = asset;
-                        break;
-                    }
+                    throw new InvalidOperationException("No prepared download URL or asset name found for the Moving Objects update.");
                 }
-
-                if (selectedAsset is null)
-                {
-                    throw new InvalidOperationException("No zip artifact found in the latest release.");
-                }
-
-                var assetNameValue = selectedAsset.Value.GetProperty("name").GetString() ?? "latest-release.zip";
-                var downloadUrl = selectedAsset.Value.GetProperty("browser_download_url").GetString()
-                    ?? throw new InvalidOperationException("No download URL found for selected release artifact.");
 
                 var zipFilePath = Path.Combine(modUpdateDirectory, assetNameValue);
                 using var downloadResponse = await Http.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
@@ -398,58 +724,103 @@ namespace LiftoffModLauncher
                 Console.SetCursorPosition(0, 0);
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine($"Error updating Moving Objects Mod: {ex.Message}");
+                Console.ForegroundColor = DefaultForegroundColor;
                 Console.ReadLine();
                 throw;
             }
             finally
             {
+                ConsoleLock.Release();
                 if (Directory.Exists(modUpdateDirectory)) Directory.Delete(modUpdateDirectory, true);
             }
         }
 
-        static SortedDictionary<MenuOption, string> menuOptions = new SortedDictionary<MenuOption, string>
-        {
-            { MenuOption.LaunchLiftoff, "Launch Liftoff" },
-            { MenuOption.LaunchLiftoffWithMods, "Launch Liftoff with Mods" },
-            { MenuOption.Exit, "Exit" },
-            { MenuOption.UpdateMovingObjectsMod, "Moving Objects Update" },
-        };
-
-
-        static List<MenuOption> disabledOptions = new List<MenuOption>
-        {
-            MenuOption.UpdateMovingObjectsMod
-        };
-
-        static int currentSelection = 0;
-        static ConsoleColor selectedColor = ConsoleColor.Red;
-        static ConsoleColor disabledColor = ConsoleColor.DarkGray;
-
         private static void RenderMenu()
         {
-            Console.Clear();
-            Console.WriteLine("Liftoff Launcher!!!");
-            Console.WriteLine($"Mods are currently {(ModsEnabled(liftoffDirectory) ? "ENABLED" : "disabled")}.");
-            Console.WriteLine("Select an option:");
-            Console.ForegroundColor = selectedColor;
-            Console.WriteLine($"1. {menuOptions.First().Value}");
-            Console.ResetColor();
-            for (int i = 1; i < menuOptions.Count; i++)
+            WithConsoleLock(() =>
             {
-                if (disabledOptions.Contains(menuOptions.ElementAt(i).Key))
+                Console.Clear();
+                Console.WriteLine("Liftoff Launcher!!!");
+                Console.WriteLine($"Mods are currently {(ModsEnabled(liftoffDirectory) ? "ENABLED" : "disabled")}.");
+                Console.WriteLine("Select an option:");
+                Console.ForegroundColor = selectedColor;
+                Console.WriteLine($"1. {menuOptions.First().Value}");
+                Console.ForegroundColor = DefaultForegroundColor;
+                for (int i = 1; i < menuOptions.Count; i++)
                 {
-                    Console.ForegroundColor = disabledColor;
-                    Console.WriteLine($"{i + 1}. {menuOptions.ElementAt(i).Value}");
-                    Console.ResetColor();
+                    if (disabledOptions.Contains(menuOptions.ElementAt(i).Key))
+                    {
+                        Console.ForegroundColor = disabledColor;
+                        Console.WriteLine($"{i + 1}. {menuOptions.ElementAt(i).Value}");
+                        Console.ForegroundColor = DefaultForegroundColor;
+                    }
+                    else
+                    {
+                        Console.WriteLine($"{i + 1}. {menuOptions.ElementAt(i).Value}");
+                    }
+                }
+                Console.SetCursorPosition(0, Console.WindowHeight - 4);
+                Console.WriteLine("Use arrow keys to navigate and enter to select.");
+                Console.WriteLine("BepInEx usually does not need updates. Only update when a mod explicitly requires a newer BepInEx version.");
+                Console.WriteLine("Distributed under the GPLv3 license. See LICENSE.txt for details.");
+            });
+        }
+
+        private static void CheckBepInExUpdate()
+        {
+            // Read the installed BepInEx version now; the latest version is fetched in the
+            // background so an offline/slow network never delays the menu.
+            string? localDllPath = null;
+            foreach (string modRoot in new[] { "BepInEx", "_BepInEx" })
+            {
+                string candidate = Path.Combine(liftoffDirectory, modRoot, "core", "BepInEx.dll");
+                if (File.Exists(candidate))
+                {
+                    localDllPath = candidate;
+                    break;
+                }
+            }
+
+            CVersion? localVersion = localDllPath != null ? ReadLocalVersion(localDllPath) : null;
+            // Background: fetch the latest release and update disabledOptions
+            _ = Task.Run(async () =>
+            {
+                (string Tag, string? ZipUrl, string? ZipName)? release = await FetchLatestReleaseAsync(BepInExReleasesApiUrl, new CVersion(5, int.MaxValue));
+                string hint;
+                if (release is null)
+                {
+                    hint = localVersion != null
+                        ? $"BepInEx: v{FormatVersion(localVersion)} (couldn't check for updates)"
+                        : "BepInEx: not installed (couldn't check for updates)";
                 }
                 else
                 {
-                    Console.WriteLine($"{i + 1}. {menuOptions.ElementAt(i).Value}");
+                    CVersion? latest = ParseVersion(release.Value.Tag);
+                    if (localVersion is null)
+                    {
+                        _updateBepInExZipUrl = release.Value.ZipUrl;
+                        _updateBepInExZipName = release.Value.ZipName;
+                        hint = $"BepInEx: not installed (install latest v{FormatVersion(latest)}?)";
+                        disabledOptions.Remove(MenuOption.UpdateBepInEx);
+                    }
+                    else if (latest is null || localVersion.CompareTo(latest) >= 0)
+                    {
+                        _BepInExInstalled = true;
+                        hint = $"BepInEx: up to date (v{FormatVersion(localVersion)})";
+                        if (!disabledOptions.Contains(MenuOption.UpdateBepInEx)) disabledOptions.Add(MenuOption.UpdateBepInEx);
+                    }
+                    else
+                    {
+                        _BepInExInstalled = true;
+                        _updateBepInExZipUrl = release.Value.ZipUrl;
+                        _updateBepInExZipName = release.Value.ZipName;
+                        hint = $"BepInEx: update (v{FormatVersion(localVersion)} -> v{FormatVersion(latest)})";
+                        disabledOptions.Remove(MenuOption.UpdateBepInEx);
+                    }
                 }
-            }
-            Console.SetCursorPosition(0, Console.WindowHeight - 3);
-            Console.WriteLine("Use arrow keys to navigate and enter to select.");
-            Console.WriteLine("Distributed under the GPLv3 license. See LICENSE.txt for details.");
+                menuOptions[MenuOption.UpdateBepInEx] = hint;
+                RenderMenu();
+            });
         }
 
         private static void CheckMovingObjectsUpdate()
@@ -457,8 +828,8 @@ namespace LiftoffModLauncher
             // Read the installed mod version now; the latest version is fetched in the
             // background so an offline/slow network never delays the menu.
             string? localDllPath = FindModDll(liftoffDirectory, MovingObjectsDllName);
-            Version? localVersion = localDllPath != null ? ReadLocalVersion(localDllPath) : null;
-            Version? latestVersion;
+            CVersion? localVersion = localDllPath != null ? ReadLocalVersion(localDllPath) : null;
+            CVersion? latestVersion;
 
             // Read the file version from BepInEx/plugins/Liftoff.MovingObjects.dll and compare it to the newest version on GitHub
             // If the version is outdated, add an update option to the menu and display a warning message
@@ -466,7 +837,7 @@ namespace LiftoffModLauncher
             // Background: fetch the latest release and update disabledOptions
             _ = Task.Run(async () =>
             {
-                (string Tag, string? ZipUrl)? release = await FetchLatestReleaseAsync(MovingObjectsReleasesApiUrl);
+                (string Tag, string? ZipUrl, string? ZipName)? release = await FetchLatestReleaseAsync(MovingObjectsReleasesApiUrl);
 
                 string hint;
                 if (release is null)
@@ -477,19 +848,23 @@ namespace LiftoffModLauncher
                 }
                 else
                 {
-                    Version? latest = ParseVersion(release.Value.Tag);
+                    CVersion? latest = ParseVersion(release.Value.Tag);
                     if (localVersion is null)
                     {
-                        hint = $"Moving Objects: not installed (latest v{FormatVersion(latest)})";
+                        _updateMovingObjectsZipUrl = release.Value.ZipUrl;
+                        _updateMovingObjectsZipName = release.Value.ZipName;
+                        hint = $"Moving Objects: not installed (install latest v{FormatVersion(latest)}?)";
+                        disabledOptions.Remove(MenuOption.UpdateMovingObjectsMod);
                     }
-                    else if (latest is null || localVersion >= latest)
+                    else if (latest is null || localVersion.CompareTo(latest) >= 0)
                     {
                         hint = $"Moving Objects: up to date (v{FormatVersion(localVersion)})";
+                        if (!disabledOptions.Contains(MenuOption.UpdateMovingObjectsMod)) disabledOptions.Add(MenuOption.UpdateMovingObjectsMod);
                     }
                     else if (release.Value.ZipUrl != null)
                     {
-                        _updateZipUrl = release.Value.ZipUrl;
-                        _updateAvailable = true;
+                        _updateMovingObjectsZipUrl = release.Value.ZipUrl;
+                        _updateMovingObjectsZipName = release.Value.ZipName;
                         hint = $"Moving Objects: update (v{FormatVersion(localVersion)} -> v{FormatVersion(latest)})";
                         disabledOptions.Remove(MenuOption.UpdateMovingObjectsMod);
                     }
@@ -506,6 +881,8 @@ namespace LiftoffModLauncher
 
         static int Main(string[] args)
         {
+            WithConsoleLock(() => Console.ForegroundColor = DefaultForegroundColor);
+
             // The game executable path is passed by Steam via %command%. When run
             // without it (e.g. the user double-clicked the launcher), act as a setup
             // helper: print the exact launch-options line with this launcher's own
@@ -514,18 +891,21 @@ namespace LiftoffModLauncher
             {
                 string launcherPath = Environment.ProcessPath ?? "LiftoffModLauncher-win-x64.exe";
 
-                Console.WriteLine("Liftoff Mod Launcher - Setup");
-                Console.WriteLine();
-                Console.WriteLine("This launcher is meant to be started by Steam, not on its own.");
-                Console.WriteLine("Copy the line below into Steam > Liftoff > Properties > Launch Options:");
-                Console.WriteLine();
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"\"{launcherPath}\" %command%");
-                Console.ResetColor();
-                Console.WriteLine();
-                Console.WriteLine("Then launch Liftoff from Steam as usual and this menu will appear.");
-                Console.WriteLine("Press Enter to exit.");
-                Console.ReadLine();
+                WithConsoleLock(() =>
+                {
+                    Console.WriteLine("Liftoff Mod Launcher - Setup");
+                    Console.WriteLine();
+                    Console.WriteLine("This launcher is meant to be started by Steam, not on its own.");
+                    Console.WriteLine("Copy the line below into Steam > Liftoff > Properties > Launch Options:");
+                    Console.WriteLine();
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"\"{launcherPath}\" %command%");
+                    Console.ForegroundColor = DefaultForegroundColor;
+                    Console.WriteLine();
+                    Console.WriteLine("Then launch Liftoff from Steam as usual and this menu will appear.");
+                    Console.WriteLine("Press Enter to exit.");
+                    Console.ReadLine();
+                });
                 return 0;
             }
 
@@ -540,13 +920,12 @@ namespace LiftoffModLauncher
 
             // Basic interface with three selectable options
             // Navigation via arrow keys and selection via enter key
-
+            CheckBepInExUpdate();
             CheckMovingObjectsUpdate();
-
             RenderMenu();
 
             int selectionOffset = 3; // Offset for the selection indicator
-            Console.SetCursorPosition(0, selectionOffset + currentSelection);
+            WithConsoleLock(() => Console.SetCursorPosition(0, selectionOffset + currentSelection));
 
             while (true)
             {
@@ -557,27 +936,39 @@ namespace LiftoffModLauncher
                     case ConsoleKey.UpArrow:
                         if (currentSelection > 0)
                         {
-                            Console.SetCursorPosition(0, selectionOffset + currentSelection);
-                            Console.Write($"{currentSelection + 1}. {menuOptions.ElementAt(currentSelection).Value}");
+                            WithConsoleLock(() =>
+                            {
+                                Console.SetCursorPosition(0, selectionOffset + currentSelection);
+                                Console.Write($"{currentSelection + 1}. {menuOptions.ElementAt(currentSelection).Value}");
+                            });
                             do currentSelection--;
                             while (currentSelection > 0 && disabledOptions.Contains(menuOptions.ElementAt(currentSelection).Key));
-                            Console.SetCursorPosition(0, selectionOffset + currentSelection);
-                            Console.ForegroundColor = selectedColor;
-                            Console.Write($"{currentSelection + 1}. {menuOptions.ElementAt(currentSelection).Value}");
-                            Console.ResetColor();
+                            WithConsoleLock(() =>
+                            {
+                                Console.SetCursorPosition(0, selectionOffset + currentSelection);
+                                Console.ForegroundColor = selectedColor;
+                                Console.Write($"{currentSelection + 1}. {menuOptions.ElementAt(currentSelection).Value}");
+                                Console.ForegroundColor = DefaultForegroundColor;
+                            });
                         }
                         break;
                     case ConsoleKey.DownArrow:
                         if (currentSelection < menuOptions.Count - 1)
                         {
-                            Console.SetCursorPosition(0, selectionOffset + currentSelection);
-                            Console.Write($"{currentSelection + 1}. {menuOptions.ElementAt(currentSelection).Value}"); // Reset previous selection color
+                            WithConsoleLock(() =>
+                            {
+                                Console.SetCursorPosition(0, selectionOffset + currentSelection);
+                                Console.Write($"{currentSelection + 1}. {menuOptions.ElementAt(currentSelection).Value}"); // Reset previous selection color
+                            });
                             do currentSelection++;
                             while (currentSelection < menuOptions.Count - 1 && disabledOptions.Contains(menuOptions.ElementAt(currentSelection).Key));
-                            Console.SetCursorPosition(0, selectionOffset + currentSelection);
-                            Console.ForegroundColor = selectedColor;
-                            Console.Write($"{currentSelection + 1}. {menuOptions.ElementAt(currentSelection).Value}");
-                            Console.ResetColor();
+                            WithConsoleLock(() =>
+                            {
+                                Console.SetCursorPosition(0, selectionOffset + currentSelection);
+                                Console.ForegroundColor = selectedColor;
+                                Console.Write($"{currentSelection + 1}. {menuOptions.ElementAt(currentSelection).Value}");
+                                Console.ForegroundColor = DefaultForegroundColor;
+                            });
                         }
                         break;
                     case ConsoleKey.Enter:
@@ -592,9 +983,14 @@ namespace LiftoffModLauncher
                                 StartGame(args[0]);
                                 return 0;
                             case MenuOption.UpdateMovingObjectsMod:
-                                UpdateMovingObjectsMod(liftoffDirectory, "geekhostuk/Liftoff.MovingObjects").GetAwaiter().GetResult();
+                                UpdateMovingObjectsMod().GetAwaiter().GetResult();
                                 currentSelection = 0;
-                                Console.SetCursorPosition(0, selectionOffset + currentSelection);
+                                WithConsoleLock(() => Console.SetCursorPosition(0, selectionOffset + currentSelection));
+                                break;
+                            case MenuOption.UpdateBepInEx:
+                                UpdateBepInEx().GetAwaiter().GetResult();
+                                currentSelection = 0;
+                                WithConsoleLock(() => Console.SetCursorPosition(0, selectionOffset + currentSelection));
                                 break;
                             case MenuOption.Exit:
                             default:

@@ -6,29 +6,36 @@ Simple launcher for Liftoff: Drone Racing to easily start the game with and with
 
 - **Launch with or without mods** from a single menu — toggling mods on or off before the game starts.
 - **Setup helper:** when you run the launcher directly (not via Steam) it prints the exact Steam launch-options line for *your* install, with the full path and quotes already filled in.
-- **Moving Objects update checker** (new): on startup the launcher checks the installed
-  [Liftoff.MovingObjects](https://github.com/geekhostuk/Liftoff.MovingObjects) mod against the latest
-  release and lets you update it in place with a single key. See below.
+- **BepInEx and Moving Objects installer/updater**: on startup the launcher checks the installed
+  [Liftoff.MovingObjects](https://github.com/geekhostuk/Liftoff.MovingObjects) mod and BepInEx (5.x) against the latest
+  release and lets you update or install it in place. See below.
 
 ## Mod update checking
 
-When the launcher opens it reads the version of the installed `Liftoff.MovingObjects.dll` and compares it
-against the latest [GitHub release](https://github.com/geekhostuk/Liftoff.MovingObjects/releases). The result
-is shown as a hint line under the mods status:
+When the launcher opens it reads the locally installed versions of both **BepInEx** and
+`Liftoff.MovingObjects.dll`, then compares them against the latest GitHub releases:
 
-- `Moving Objects: up to date (v1.3.6)` — you have the latest version.
-- `Moving Objects: UPDATE available v1.3.7 (installed v1.3.6) - press U to install` — a newer release exists.
-- `Moving Objects: not installed` / `... (couldn't check for updates)` — the mod is missing, or the check
-  could not reach GitHub.
+- [BepInEx releases](https://github.com/BepInEx/BepInEx/releases)
+- [Liftoff.MovingObjects releases](https://github.com/geekhostuk/Liftoff.MovingObjects/releases)
 
-The check runs in the background, so an offline or slow connection never blocks or delays the menu. When an
-update is available, press **U** to download the release, extract it, and replace the plugin and patcher DLLs
-in place. Each replaced file is backed up first and automatically rolled back if anything goes wrong.
+The check runs in the background, so the menu appears immediately even with a slow or offline connection.
+
+Instead of a separate hotkey, update/install actions are shown directly as dedicated selectable menu entries:
+
+- `Moving Objects: up to date (v...)` or `Moving Objects: update (v... -> v...)`
+- `Moving Objects: not installed (install latest v...?)`
+- `BepInEx: up to date (v...)` or `BepInEx: update (v... -> v...)`
+- `BepInEx: not installed (install latest v...?)`
+- `... (couldn't check for updates)` when GitHub cannot be reached
+
+When an update or install is available, select the corresponding menu option and press **Enter**.
+The launcher downloads the release ZIP, extracts it, replaces files in place, and rolls back from backup
+automatically if anything fails.
 
 ![Update available in the launcher](UpdateCheckExample.png)
 
 ### Disclaimer
-Only the windows build is tested and supported. The Linux and MacOS builds are untested and may not work.\
+Only the windows build is tested and supported. The Linux and MacOS builds are untested and probably won't work.\
 Please report any issues you encounter on the [Issues](https://github.com/AMPW-german/LiftoffModLauncher/issues) page.\
 The launcher is not affiliated with or endorsed by LuGus Studios. It is a third-party tool created by the community to enhance the modding experience for Liftoff: Drone Racing.\
 The launcher has a size of ~70-80MB due to the .NET runtime being bundled with it. It is a standalone application and does not require any additional dependencies to run.
